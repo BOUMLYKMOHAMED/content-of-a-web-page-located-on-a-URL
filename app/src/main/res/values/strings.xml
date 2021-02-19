@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">Get Web Page Source Code</string>
+    <string name="enter_url">Enter URL :</string>
+    <string name="get_page_source">get page source</string>
+</resources>
