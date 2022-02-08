@@ -15,11 +15,6 @@ REVISION="0.1"
 
 . $PROGPATH/utils.sh
 
-if [ $# -le 2 ] ; then
-	echo "Wrong Parameter Count!"
-	exit
-fi
-
 REMOTE_SERVER=$2 && shift 2
 if [ -z REMOTE_SERVER ]
 then
@@ -41,8 +36,11 @@ print_usage() {
   echo "  $PROGNAME -H <Hostname/IP address> [-U Oracle OS User] --tns <ORACLE_SID>"
   echo "  $PROGNAME -H <Hostname/IP address> [-U Oracle OS User] --db <ORACLE_SID>"
   echo "  $PROGNAME -H <Hostname/IP address> [-U Oracle OS User] --login <ORACLE_SID>"
+  echo "  $PROGNAME -H <Hostname/IP address> [-U Oracle OS User] --sessions <ORACLE_SID> <CRITICAL> <WARNING>"
   echo "  $PROGNAME -H <Hostname/IP address> [-U Oracle OS User] --cache <ORACLE_SID> <CRITICAL> <WARNING>"
+  echo "  $PROGNAME -H <Hostname/IP address> [-U Oracle OS User] --parsing <ORACLE_SID> <CRITICAL> <WARNING>"
   echo "  $PROGNAME -H <Hostname/IP address> [-U Oracle OS User] --tablespace <ORACLE_SID> <TABLESPACE> <CRITICAL> <WARNING>"
+  echo "  $PROGNAME -H <Hostname/IP address> [-U Oracle OS User] --diskgroup <ORACLE_SID> <DISKGROUP> <CRITICAL> <WARNING>"
   echo "  $PROGNAME --help"
   echo "  $PROGNAME --version"
 }
@@ -57,13 +55,19 @@ print_help() {
   echo "--tns SID/IP Address"
   echo "   Check remote TNS server"
   echo "--db SID"
-  echo "   Check local database (search /bin/ps for PMON process)"
+  echo "   Check remote database (search /bin/ps for PMON process)"
+  echo "--sessions SID"
+  echo "   Check remote database concurrent active sessions"
   echo "--login SID"
   echo "   Attempt a dummy login and alert if not ORA-01017: invalid username/password"
   echo "--cache"
-  echo "   Check local database for library and buffer cache hit ratios"
+  echo "   Check remote database for library and buffer cache hit ratios"
+  echo "--parsing"
+  echo "   Check remote database for Soft/Hard parse ratios"
   echo "--tablespace"
-  echo "   Check local database for tablespace capacity in ORACLE_SID"
+  echo "   Check remote database for tablespace capacity in ORACLE_SID"
+  echo "--diskgroup"
+  echo "   Check remote database for diskgroup capacity in ORACLE_ASM_SID (Tipically +ASM1/2...)"
   echo "--help"
   echo "   Print this help screen"
   echo "--version"
@@ -139,7 +143,17 @@ EOF`
 	echo $ORACLE_HOME
 	done
 fi'
-ORACLE_HOME=`ssh $ORACLE_OSUSER@$REMOTE_SERVER -x "ORACLE_SID=${2} ; ${GET_ORACLE_HOME}"`
+
+# We don't really need the ASM ORACLE_SID to be passed as a parameter, do we?
+
+if [ "$cmd" == "--diskgroup" ] ; then
+    ORACLE_SID=`ssh $ORACLE_OSUSER@$REMOTE_SERVER -x "ps -ef|grep asm_pmon|grep -v grep |cut -d_ -f3"`
+fi
+
+if [ -z "$ORACLE_SID" ] ; then
+	ORACLE_SID=$2
+fi
+ORACLE_HOME=`ssh $ORACLE_OSUSER@$REMOTE_SERVER -x "ORACLE_SID=${ORACLE_SID} ; ${GET_ORACLE_HOME}"`
 
 if [ "$cmd" != "--db" ]; then
 	if [ -z "$ORACLE_HOME" -o ! `ssh $ORACLE_OSUSER@$REMOTE_SERVER -x "ls -d ${ORACLE_HOME}"` ] ; then
@@ -182,6 +196,57 @@ case "$cmd" in
 	echo "CRITICAL - $loginchk3"
 	exit $STATE_CRITICAL
     fi
+    ;;
+--sessions)
+    if [ "$#" -ne 4 ] ; then 
+	echo "Wrong Parameter Count!!!"
+	exit
+    fi
+ORACLE_SID=${2}
+
+    if [ ${3} -lt ${4} ] ; then
+	echo "UNKNOWN - Warning level is less than Critical"
+	exit $STATE_UNKNOWN
+    fi
+
+    connect_to_server(){
+	ssh $ORACLE_OSUSER@$REMOTE_SERVER -x "ORACLE_HOME=${ORACLE_HOME};PATH=$PATH:$ORACLE_HOME/bin;LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ORACLE_HOME/lib;ORACLE_SID=${ORACLE_SID} ;export ORACLE_HOME ORACLE_SID PATH LD_LIBRARY_PATH;$GET_RESULT"
+	exit
+}
+
+    GET_RESULT="sqlplus -s / as sysdba <<EOF
+set pagesize 0
+set numf '99'
+select count(SES.SID)
+from  v\\\$session SES, V\\\$SQLAREA SQL, V\\\$SESSION_WAIT WA, V\\\$PROCESS P
+where SES.STATUS='ACTIVE'
+AND SES.SQL_ID=SQL.SQL_ID
+AND SES.SID=WA.SID
+and SES.paddr=p.addr
+and SES.USERNAME not in ('SYS','SYSMAN','MDSYS')
+/
+EOF"
+    result=`connect_to_server`;
+
+    if [ -n "`echo $result | grep ORA-`" ] ; then
+      error=` echo "$result" | grep "ORA-" | head -1`
+      echo "CRITICAL - $error"
+      exit $STATE_CRITICAL
+    fi
+
+    sessions=`echo "$result" | awk '/^[0-9\. \t]+$/ {print int($1)}'` 
+
+    if [ $sessions -gt ${3} ] ; then
+  	echo "${2} CRITICAL - Concurrent Active Sessions Count: $sessions |Sessions=$sessions;${4};${3};0;20"
+	exit $STATE_CRITICAL
+    fi
+    if [ $sessions -gt ${4} ] ; then
+  	echo "${2} WARNING - Concurrent Active Sessions Count: $sessions |Sessions=$sessions;${4};${3};0;20"
+	exit $STATE_WARNING
+    fi
+    echo "${2} OK - Concurrent Active Sessions Count: $sessions |Sessions=$sessions;${4};${3};0;20"
+
+    exit $STATE_OK
     ;;
 --cache)
     if [ "$#" -ne 4 ] ; then 
@@ -250,6 +315,144 @@ EOF"
 
     exit $STATE_OK
     ;;
+
+--parsing)
+    if [ "$#" -ne 4 ] ; then 
+	echo "Wrong Parameter Count!!!"
+	exit
+    fi
+ORACLE_SID=${2}
+
+    if [ ${3} -gt ${4} ] ; then
+	echo "UNKNOWN - Warning level is less than Critical"
+	exit $STATE_UNKNOWN
+    fi
+
+    connect_to_server(){
+	ssh $ORACLE_OSUSER@$REMOTE_SERVER -x "ORACLE_HOME=${ORACLE_HOME};PATH=$PATH:$ORACLE_HOME/bin;LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ORACLE_HOME/lib;ORACLE_SID=${ORACLE_SID} ;export ORACLE_HOME ORACLE_SID PATH LD_LIBRARY_PATH;$GET_RESULT"
+	exit
+}
+
+    GET_RESULT="sqlplus -s / as sysdba <<EOF
+set pagesize 0
+set numf '9999999.99'
+SELECT ROUND ( ( (SELECT SUM (VALUE)
+FROM v\\\$sysstat
+WHERE NAME = 'parse count (total)')
+- (SELECT SUM (VALUE)
+FROM v\\\$sysstat
+WHERE NAME = 'parse count (hard)')
+)
+/ (SELECT SUM (VALUE)
+FROM v\\\$sysstat
+WHERE NAME = 'parse count (total)')
+* 100,2) FROM DUAL
+/
+EOF"
+    result=`connect_to_server`;
+
+    if [ -n "`echo $result | grep ORA-`" ] ; then
+      error=` echo "$result" | grep "ORA-" | head -1`
+      echo "CRITICAL - $error"
+      exit $STATE_CRITICAL
+    fi
+
+    soft_parses=`echo "$result" | awk '/^[0-9\. \t]+$/ {print int($1)}'` 
+    soft_parsesx=`echo "$result" | awk '/^[0-9\. \t]+$/ {print $1}'` 
+    GET_RESULT="sqlplus -s / as sysdba << EOF
+set pagesize 0
+set numf '9999999.99'
+SELECT ROUND ( (SELECT SUM (VALUE)
+FROM v\\\$sysstat
+WHERE NAME = 'parse count (hard)')
+/ (SELECT SUM (VALUE)
+FROM v\\\$sysstat
+WHERE NAME = 'parse count (total)')
+* 100,2) FROM DUAL;
+EOF"
+	
+    result=`connect_to_server`;
+
+    if [ -n "`echo $result | grep ORA-`" ] ; then
+      error=` echo "$result" | grep "ORA-" | head -1`
+      echo "CRITICAL - $error"
+      exit $STATE_CRITICAL
+    fi
+
+    hard_parses=`echo "$result" | awk '/^[0-9\. \t]+$/ {print int($1)}'`
+    hard_parsesx=`echo "$result" | awk '/^[0-9\. \t]+$/ {print $1}'`
+
+    if [ $soft_parses -le ${3} -o $hard_parses -ge $(( 100-${3} )) ] ; then
+  	echo "${2} CRITICAL - Parse Ratio %: $soft_parsesx% Soft -- $hard_parsesx% Hard|Soft=$soft_parsesx%;${4};${3};0;100 Hard=$hard_parsesx%;${4};${3};0;100"
+	exit $STATE_CRITICAL
+    fi
+    if [ $soft_parses -le ${4} -o $hard_parses -ge $(( 100-${4} )) ] ; then
+  	echo "${2} WARNING  - Parse Ratio %: $soft_parsesx% Soft -- $hard_parsesx% Hard|Soft=$soft_parsesx%;${4};${3};0;100 Hard=$hard_parsesx%;${4};${3};0;100"
+	exit $STATE_WARNING
+    fi
+    echo "${2} OK - Parse Ratio %: $soft_parsesx% Soft -- $hard_parsesx% Hard|Soft=$soft_parsesx%;${4};${3};0;100 Hard=$hard_parsesx%;${4};${3};0;100"
+
+    exit $STATE_OK
+    ;;
+
+--undo)
+    if [ "$#" -ne 4 ] ; then 
+	echo "Wrong Parameter Count!!!"
+	exit
+    fi
+    if [ ${3} -lt ${4} ] ; then
+	echo "UNKNOWN - Warning level is more than Critical"
+	exit $STATE_UNKNOWN
+    fi
+
+    ORACLE_SID=$2
+
+    connect_to_server(){
+        ssh $ORACLE_OSUSER@$REMOTE_SERVER -x " ORACLE_HOME=${ORACLE_HOME};PATH=$PATH:$ORACLE_HOME/bin;LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ORACLE_HOME/lib;ORACLE_SID=${ORACLE_SID} ;export ORACLE_HOME ORACLE_SID PATH LD_LIBRARY_PATH;$GET_RESULT"
+        exit
+}
+
+    GET_RESULT="sqlplus -s / as sysdba << EOF
+set pagesize 0
+set numf '9999999.99'
+select NVL(b.free,0.0),a.total,100 - trunc(NVL(b.free,0.0)/a.total * 1000) / 10 prc
+from (select tablespace_name,sum(bytes)/1024/1024 total
+FROM DBA_UNDO_EXTENTS group by tablespace_name) A
+LEFT OUTER JOIN
+( select tablespace_name,sum(bytes)/1024/1024 free
+FROM DBA_UNDO_EXTENTS WHERE STATUS='EXPIRED' group by tablespace_name) B
+ON a.tablespace_name=b.tablespace_name WHERE a.tablespace_name like 'UNDO%';
+EOF"
+
+    result=`connect_to_server`;
+
+    if [ -n "`echo $result | grep ORA-`" ] ; then
+      error=` echo "$result" | grep "ORA-" | head -1`
+      echo "CRITICAL - $error"
+      exit $STATE_CRITICAL
+    fi
+
+    ts_free=`echo "$result" | awk '/^[ 0-9\.\t ]+$/ {print int($1)}'` 
+    ts_total=`echo "$result" | awk '/^[ 0-9\.\t ]+$/ {print int($2)}'` 
+    ts_pct=`echo "$result" | awk '/^[ 0-9\.\t ]+$/ {print int($3)}'` 
+    ts_pctx=`echo "$result" | awk '/^[ 0-9\.\t ]+$/ {print $3}'` 
+    ts_usedx=`echo $(( $ts_total - $ts_free ))` 
+    if [ "$ts_free" -eq 0 -a "$ts_total" -eq 0 -a "$ts_pct" -eq 0 ] ; then
+        echo "No data returned by Oracle - No tablespace starting by UNDO% found"
+        exit $STATE_UNKNOWN
+    fi
+    if [ "$ts_pct" -ge ${4} ] ; then
+  	echo "${2} : UNDO CRITICAL - $ts_pctx% used [ $ts_free / $ts_total MB available ]|UNDO_USED=${ts_usedx}MB"
+	exit $STATE_CRITICAL
+    fi
+    if [ "$ts_pct" -ge ${3} ] ; then
+  	echo "${2} : UNDO WARNING  - $ts_pctx% used [ $ts_free / $ts_total MB available ]|UNDO_USED=${ts_usedx}MB"
+	exit $STATE_WARNING
+    fi
+    echo "${2} : UNDO OK - $ts_pctx% used [ $ts_free / $ts_total MB available ]|UNDO_USED=${ts_usedx}MB"
+    exit $STATE_OK
+    ;;
+
 --tablespace)
     if [ "$#" -ne 5 ] ; then 
 	echo "Wrong Parameter Count!!!"
@@ -292,19 +495,81 @@ EOF"
     ts_total=`echo "$result" | awk '/^[ 0-9\.\t ]+$/ {print int($2)}'` 
     ts_pct=`echo "$result" | awk '/^[ 0-9\.\t ]+$/ {print int($3)}'` 
     ts_pctx=`echo "$result" | awk '/^[ 0-9\.\t ]+$/ {print $3}'` 
+    ts_usedx=`echo $(( $ts_total - $ts_free ))` 
     if [ "$ts_free" -eq 0 -a "$ts_total" -eq 0 -a "$ts_pct" -eq 0 ] ; then
-        echo "No data returned by Oracle - tablespace $5 not found?"
+        echo "No data returned by Oracle - tablespace $3 not found?"
         exit $STATE_UNKNOWN
     fi
     if [ "$ts_pct" -ge ${4} ] ; then
-  	echo "${2} : ${3} CRITICAL - $ts_pctx% used [ $ts_free / $ts_total MB available ]|${3}=$ts_pctx%;${5};${4};0;100"
+  	echo "${2} : ${3} CRITICAL - $ts_pctx% used [ $ts_free / $ts_total MB available ]|${3}=${ts_usedx}MB"
 	exit $STATE_CRITICAL
     fi
     if [ "$ts_pct" -ge ${5} ] ; then
-  	echo "${2} : ${3} WARNING  - $ts_pctx% used [ $ts_free / $ts_total MB available ]|${3}=$ts_pctx%;${5};${4};0;100"
+  	echo "${2} : ${3} WARNING  - $ts_pctx% used [ $ts_free / $ts_total MB available ]|${3}=${ts_usedx}MB"
 	exit $STATE_WARNING
     fi
-    echo "${2} : ${3} OK - $ts_pctx% used [ $ts_free / $ts_total MB available ]|${3}=$ts_pctx%;${5};${4};0;100"
+    echo "${2} : ${3} OK - $ts_pctx% used [ $ts_free / $ts_total MB available ]|${3}=${ts_usedx}MB"
+    exit $STATE_OK
+    ;;
+
+--diskgroup)
+    if [ "$#" -ne 4 ] ; then 
+	echo "Wrong Parameter Count!!!"
+	exit
+    fi
+    if [ ${3} -lt ${4} ] ; then
+	echo "UNKNOWN - Warning level is more than Critical"
+	exit $STATE_UNKNOWN
+    fi
+
+    ORACLE_SID=`ssh $ORACLE_OSUSER@$REMOTE_SERVER -x "ps -ef|grep asm_pmon|grep -v grep |cut -d_ -f3"`
+
+    connect_to_server(){
+        ssh $ORACLE_OSUSER@$REMOTE_SERVER -x "ORACLE_HOME=${ORACLE_HOME};PATH=$PATH:$ORACLE_HOME/bin;LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$ORACLE_HOME/lib;ORACLE_SID=${ORACLE_SID} ;export ORACLE_HOME ORACLE_SID PATH LD_LIBRARY_PATH;$GET_RESULT"
+        exit
+}
+
+    GET_RESULT="sqlplus -s / as sysasm << EOF
+set pagesize 0
+set numf '9999999.99'
+set feedb off
+select NVL(b.free,0.0),a.total,100 - trunc(NVL(b.free,0.0)/a.total * 1000) / 10 prc
+from (
+select NAME,TOTAL_MB total
+from V\\\$ASM_DISKGROUP) A
+LEFT OUTER JOIN
+( select NAME,FREE_MB  free
+from V\\\$ASM_DISKGROUP) B
+ON a.name=b.name WHERE a.name='${2}'
+/
+EOF"
+
+    result=`connect_to_server`;
+
+    if [ -n "`echo $result | grep ORA-`" ] ; then
+      error=` echo "$result" | grep "ORA-" | head -1`
+      echo "CRITICAL - $error"
+      exit $STATE_CRITICAL
+    fi
+
+    dg_free=`echo "$result" | awk '/^[ 0-9\.\t ]+$/ {print int($1)}'` 
+    dg_total=`echo "$result" | awk '/^[ 0-9\.\t ]+$/ {print int($2)}'` 
+    dg_pct=`echo "$result" | awk '/^[ 0-9\.\t ]+$/ {print int($3)}'` 
+    dg_pctx=`echo "$result" | awk '/^[ 0-9\.\t ]+$/ {print $3}'` 
+    dg_usedx=`echo $(( $dg_total-$dg_free ))` 
+    if [ "$dg_free" -eq 0 -a "$dg_total" -eq 0 -a "$dg_pct" -eq 0 ] ; then
+        echo "No data returned by Oracle - diskgroup $2 not found?"
+        exit $STATE_UNKNOWN
+    fi
+    if [ "$dg_pct" -ge ${3} ] ; then
+  	echo "${ORACLE_SID} : ${2} CRITICAL - $dg_pctx% used [ $dg_free / $dg_total MB available ]|${2}=${dg_usedx}MB"
+	exit $STATE_CRITICAL
+    fi
+    if [ "$dg_pct" -ge ${4} ] ; then
+  	echo "${ORACLE_SID} : ${2} WARNING  - $dg_pctx% used [ $dg_free / $dg_total MB available ]|${2}=${dg_usedx}MB"
+	exit $STATE_WARNING
+    fi
+    echo "${ORACLE_SID} : ${2} OK - $dg_pctx% used [ $dg_free / $dg_total MB available ]|${2}=${dg_usedx}MB"
     exit $STATE_OK
     ;;
 *)
